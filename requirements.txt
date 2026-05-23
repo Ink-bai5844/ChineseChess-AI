@@ -1,0 +1,12 @@
+# Core numerical / ML stack
+numpy>=1.23
+torch>=2.0
+h5py>=3.8
+
+# GUI play interface
+pygame>=2.5
+
+# Training visualizations and GIF export
+Pillow>=9.5
+matplotlib>=3.7
+tqdm>=4.66

@@ -7,8 +7,11 @@ import math
 import random
 import sqlite3
 import sys
+from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
+from queue import Queue
+from threading import Thread
 from typing import Any, Iterator
 
 import numpy as np
@@ -61,6 +64,16 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--amp", choices=["off", "fp16", "bf16"], default="bf16", help="mixed precision mode on CUDA")
+    parser.add_argument("--tf32", action=argparse.BooleanOptionalAction, default=True, help="allow TF32 matmul/cudnn on CUDA")
+    parser.add_argument("--compile", action="store_true", help="use torch.compile for the train/validation forward path")
+    parser.add_argument(
+        "--compile-mode",
+        choices=["default", "reduce-overhead", "max-autotune"],
+        default="default",
+        help="torch.compile mode; max-autotune may print Triton resource warnings on some GPUs",
+    )
+    parser.add_argument("--channels-last", action=argparse.BooleanOptionalAction, default=True, help="use channels_last memory format")
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--value-loss-weight", type=float, default=0.35)
@@ -87,12 +100,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mirror-augment", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--check-legal", action="store_true", help="validate moves with the project rule generator")
     parser.add_argument("--start-rowid", type=int, default=0)
+    parser.add_argument("--epoch-rowid-stride", type=int, default=0, help="advance train start rowid by this amount each epoch")
+    parser.add_argument("--shuffle-start-rowid", action="store_true", help="randomize train start rowid each epoch")
     parser.add_argument("--chunk-size", type=int, default=4096)
+    parser.add_argument("--prefetch-batches", type=int, default=2, help="CPU batch prefetch queue size; 0 disables prefetch")
 
     parser.add_argument("--metrics-csv", type=Path, default=SCRIPT_DIR / "runs/cchess_dataset_train.csv")
     parser.add_argument("--progress", action=argparse.BooleanOptionalAction, default=True, help="show tqdm progress bars")
 
     parser.add_argument("--eval-teacher-games", type=int, default=0, help="student-vs-ChineseChess-AlphaZero games after each epoch")
+    parser.add_argument("--eval-every", type=int, default=1, help="run teacher evaluation every N epochs; 1 means every epoch")
     parser.add_argument("--eval-student-mcts-sims", type=int, default=64)
     parser.add_argument("--eval-teacher-mcts-sims", type=int, default=0)
     parser.add_argument("--eval-cpuct", type=float, default=1.5)
@@ -233,6 +250,45 @@ def iter_rows(db_path: Path, *, start_rowid: int, chunk_size: int) -> Iterator[s
         con.close()
 
 
+def sqlite_max_rowid(db_path: Path) -> int:
+    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        value = con.execute("SELECT max(rowid) FROM XQPGN").fetchone()[0]
+        return int(value or 0)
+    finally:
+        con.close()
+
+
+def epoch_train_start_rowid(
+    args: argparse.Namespace,
+    *,
+    epoch: int,
+    max_rowid: int,
+    rng: random.Random,
+) -> int:
+    base = max(0, int(args.start_rowid))
+    if args.shuffle_start_rowid:
+        if max_rowid <= 0:
+            return base
+        reserve = max(0, int(args.max_games_per_epoch))
+        max_start = max(base, max_rowid - reserve) if reserve > 0 else max_rowid
+        if max_start <= base:
+            return base
+        return rng.randint(base, max_start)
+    stride = max(0, int(args.epoch_rowid_stride))
+    if stride <= 0:
+        return base
+    start = base + (epoch - 1) * stride
+    if max_rowid <= 0:
+        return start
+    reserve = max(0, int(args.max_games_per_epoch))
+    max_start = max(base, max_rowid - reserve) if reserve > 0 else max_rowid
+    span = max_start - base + 1
+    if span <= 0:
+        return base
+    return base + ((start - base) % span)
+
+
 def make_progress_bar(args: argparse.Namespace, *, total: int, desc: str):
     if not args.progress:
         return None
@@ -243,11 +299,17 @@ def make_progress_bar(args: argparse.Namespace, *, total: int, desc: str):
     return tqdm(total=total or None, desc=desc, unit="game", dynamic_ncols=True)
 
 
-def iter_examples(db_path: Path, args: argparse.Namespace, *, train: bool) -> Iterator[tuple[np.ndarray, np.ndarray, float]]:
+def iter_examples(
+    db_path: Path,
+    args: argparse.Namespace,
+    *,
+    train: bool,
+    start_rowid_override: int | None = None,
+) -> Iterator[tuple[np.ndarray, np.ndarray, float]]:
     games = 0
     positions = 0
     max_games = args.max_games_per_epoch if train else args.val_games
-    start_rowid = args.start_rowid if train else 0
+    start_rowid = start_rowid_override if train and start_rowid_override is not None else args.start_rowid if train else 0
     pbar = make_progress_bar(args, total=max_games, desc="train games" if train else "val games")
     try:
         for raw in iter_rows(db_path, start_rowid=start_rowid, chunk_size=args.chunk_size):
@@ -327,6 +389,50 @@ def batch_examples(
         yield np.stack(states), np.stack(policies), np.asarray(values, dtype=np.float32)
 
 
+def prefetch_batches(
+    batches: Iterator[tuple[np.ndarray, np.ndarray, np.ndarray]],
+    max_prefetch: int,
+) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    if max_prefetch <= 0:
+        yield from batches
+        return
+
+    sentinel = object()
+    queue: Queue = Queue(maxsize=max_prefetch)
+
+    def worker() -> None:
+        try:
+            for batch in batches:
+                queue.put(batch)
+        except BaseException as exc:
+            queue.put(exc)
+        finally:
+            queue.put(sentinel)
+
+    Thread(target=worker, name="dataset_batch_prefetch", daemon=True).start()
+    while True:
+        item = queue.get()
+        if item is sentinel:
+            break
+        if isinstance(item, BaseException):
+            raise item
+        yield item
+
+
+def make_train_batches(
+    args: argparse.Namespace,
+    *,
+    train: bool,
+    start_rowid_override: int | None = None,
+) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    db_path = args.train_db if train else args.val_db
+    batches = batch_examples(
+        iter_examples(db_path, args, train=train, start_rowid_override=start_rowid_override),
+        args.batch_size,
+    )
+    return prefetch_batches(batches, args.prefetch_batches)
+
+
 def load_or_create_model(args: argparse.Namespace, device: torch.device) -> tuple[CChessDistillNet, StudentConfig, int]:
     source = None
     if args.model.exists() and not args.fresh:
@@ -352,31 +458,80 @@ def load_or_create_model(args: argparse.Namespace, device: torch.device) -> tupl
     return model, config, 0
 
 
+def configure_torch_runtime(args: argparse.Namespace, device: torch.device) -> None:
+    if device.type != "cuda":
+        return
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = bool(args.tf32)
+    torch.backends.cudnn.allow_tf32 = bool(args.tf32)
+    if args.tf32:
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+
+
+def amp_dtype(args: argparse.Namespace, device: torch.device):
+    if device.type != "cuda" or args.amp == "off":
+        return None
+    return torch.float16 if args.amp == "fp16" else torch.bfloat16
+
+
+def autocast_context(args: argparse.Namespace, device: torch.device):
+    dtype = amp_dtype(args, device)
+    if dtype is None:
+        return nullcontext()
+    return torch.amp.autocast(device_type="cuda", dtype=dtype)
+
+
+def prepare_runtime_model(model: CChessDistillNet, args: argparse.Namespace, device: torch.device):
+    if args.channels_last and device.type == "cuda":
+        model.to(memory_format=torch.channels_last)
+    if args.compile:
+        try:
+            return torch.compile(model, mode=args.compile_mode)
+        except Exception as exc:
+            print(f"[train_dataset] torch.compile disabled: {exc}", flush=True)
+    return model
+
+
+def tensor_states(states_np: np.ndarray, args: argparse.Namespace, device: torch.device) -> torch.Tensor:
+    states = torch.tensor(states_np, dtype=torch.float32, device=device)
+    if args.channels_last and device.type == "cuda":
+        states = states.contiguous(memory_format=torch.channels_last)
+    return states
+
+
 def run_train_epoch(
     model: CChessDistillNet,
     args: argparse.Namespace,
     optimizer: optim.Optimizer,
     device: torch.device,
+    *,
+    start_rowid: int | None = None,
 ) -> dict[str, float]:
     model.train()
     policy_losses: list[float] = []
     value_losses: list[float] = []
     accuracies: list[float] = []
     examples_seen = 0
-    for states_np, policies_np, values_np in batch_examples(iter_examples(args.train_db, args, train=True), args.batch_size):
-        states = torch.tensor(states_np, dtype=torch.float32, device=device)
-        policies = torch.tensor(policies_np, dtype=torch.float32, device=device)
+    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda" and args.amp == "fp16")
+    for states_np, policies_np, values_np in make_train_batches(args, train=True, start_rowid_override=start_rowid):
+        states = tensor_states(states_np, args, device)
         values = torch.tensor(values_np, dtype=torch.float32, device=device)
-        target_actions = policies.argmax(dim=1)
-        logits, predicted_values = model(states)
-        policy_loss = F.cross_entropy(logits, target_actions)
-        value_loss = F.mse_loss(predicted_values, values)
-        loss = policy_loss + args.value_loss_weight * value_loss
+        target_actions = torch.tensor(policies_np.argmax(axis=1), dtype=torch.long, device=device)
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+        with autocast_context(args, device):
+            logits, predicted_values = model(states)
+            policy_loss = F.cross_entropy(logits, target_actions)
+            value_loss = F.mse_loss(predicted_values.float(), values)
+            loss = policy_loss + args.value_loss_weight * value_loss
+        scaler.scale(loss).backward()
         if args.gradient_clip > 0:
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.gradient_clip)
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
 
         examples_seen += int(states.size(0))
         policy_losses.append(float(policy_loss.detach().cpu()))
@@ -393,14 +548,14 @@ def run_validation(model: CChessDistillNet, args: argparse.Namespace, device: to
     top5s: list[float] = []
     examples_seen = 0
     with torch.inference_mode():
-        for states_np, policies_np, values_np in batch_examples(iter_examples(args.val_db, args, train=False), args.batch_size):
-            states = torch.tensor(states_np, dtype=torch.float32, device=device)
-            policies = torch.tensor(policies_np, dtype=torch.float32, device=device)
+        for states_np, policies_np, values_np in make_train_batches(args, train=False):
+            states = tensor_states(states_np, args, device)
             values = torch.tensor(values_np, dtype=torch.float32, device=device)
-            target_actions = policies.argmax(dim=1)
-            logits, predicted_values = model(states)
+            target_actions = torch.tensor(policies_np.argmax(axis=1), dtype=torch.long, device=device)
+            with autocast_context(args, device):
+                logits, predicted_values = model(states)
             policy_losses.append(float(F.cross_entropy(logits, target_actions).detach().cpu()))
-            value_losses.append(float(F.mse_loss(predicted_values, values).detach().cpu()))
+            value_losses.append(float(F.mse_loss(predicted_values.float(), values).detach().cpu()))
             predictions = logits.argmax(dim=1)
             top5 = logits.topk(k=5, dim=1).indices
             accuracies.append(float((predictions == target_actions).float().mean().detach().cpu()))
@@ -667,8 +822,10 @@ def main() -> None:
     if args.require_cuda and not str(device_name).startswith("cuda"):
         raise RuntimeError("CUDA was required, but torch.cuda.is_available() is false.")
     device = torch.device(device_name)
+    configure_torch_runtime(args, device)
 
     model, config, start_iteration = load_or_create_model(args, device)
+    runtime_model = prepare_runtime_model(model, args, device)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     eval_teacher = None
     if args.eval_teacher_games > 0:
@@ -688,6 +845,14 @@ def main() -> None:
                 "device": str(device),
                 "value_source": args.value_source,
                 "mirror_augment": args.mirror_augment,
+                "start_rowid": args.start_rowid,
+                "epoch_rowid_stride": args.epoch_rowid_stride,
+                "shuffle_start_rowid": args.shuffle_start_rowid,
+                "amp": args.amp,
+                "tf32": args.tf32,
+                "compile": args.compile,
+                "compile_mode": args.compile_mode,
+                "channels_last": args.channels_last,
                 "eval_teacher_games": args.eval_teacher_games,
                 "eval_teacher_backend": None if eval_teacher is None else eval_teacher.backend,
             },
@@ -697,10 +862,15 @@ def main() -> None:
     )
 
     eval_rng = random.Random(args.eval_seed)
+    data_rng = random.Random(args.eval_seed + 1009)
+    train_max_rowid = sqlite_max_rowid(args.train_db) if args.shuffle_start_rowid or args.epoch_rowid_stride > 0 else 0
     try:
         for epoch in range(start_iteration + 1, start_iteration + args.epochs + 1):
-            train_metrics = run_train_epoch(model, args, optimizer, device)
-            val_metrics = run_validation(model, args, device)
+            train_start_rowid = epoch_train_start_rowid(args, epoch=epoch, max_rowid=train_max_rowid, rng=data_rng)
+            print(f"epoch {epoch} train_start_rowid {train_start_rowid}", flush=True)
+            train_metrics = run_train_epoch(runtime_model, args, optimizer, device, start_rowid=train_start_rowid)
+            val_metrics = run_validation(runtime_model, args, device)
+            should_eval = eval_teacher is not None and args.eval_every > 0 and epoch % args.eval_every == 0
             eval_metrics = (
                 evaluate_against_teacher(
                     model=model,
@@ -710,7 +880,7 @@ def main() -> None:
                     epoch=epoch,
                     rng=eval_rng,
                 )
-                if eval_teacher is not None
+                if should_eval
                 else {
                     "eval_games": 0,
                     "eval_wins": 0,
@@ -722,6 +892,7 @@ def main() -> None:
             )
             row = {
                 "epoch": epoch,
+                "train_start_rowid": train_start_rowid,
                 "train_examples": int(train_metrics["examples"]),
                 "train_policy_loss": train_metrics["policy_loss"],
                 "train_value_loss": train_metrics["value_loss"],
@@ -734,15 +905,17 @@ def main() -> None:
                 **eval_metrics,
             }
             append_metrics(args.metrics_csv, row)
+            saved_label = "[dry-run]" if args.dry_run else "[not saved]"
             if not args.dry_run and args.save_every > 0 and epoch % args.save_every == 0:
                 save_checkpoint(args.model, model=model, config=config, optimizer=optimizer, iteration=epoch, args=args, metrics=row)
+                saved_label = str(args.model)
             print(
                 f"epoch {epoch} | train {int(train_metrics['examples'])} "
                 f"| policy_loss {train_metrics['policy_loss']:.4f} value_loss {train_metrics['value_loss']:.4f} "
                 f"| acc {train_metrics['policy_acc']:.3f} | val_acc {val_metrics['policy_acc']:.3f} "
                 f"top5 {val_metrics['top5']:.3f} "
                 f"| eval W/D/L {eval_metrics['eval_wins']}/{eval_metrics['eval_draws']}/{eval_metrics['eval_losses']} "
-                f"| saved {args.model if not args.dry_run else '[dry-run]'}",
+                f"| saved {saved_label}",
                 flush=True,
             )
     finally:
