@@ -31,7 +31,7 @@ from cchess_alphazero.lib.model_helper import load_model_weight
 ACTION_SIZE = len(ActionLabelsRed)
 BOARD_SHAPE = (14, 10, 9)
 DEFAULT_MODEL_DIR = PROJECT_ROOT / "data/model"
-DEFAULT_STUDENT = SCRIPT_DIR / "models/cchess_distilled_resattn.pt"
+DEFAULT_STUDENT = SCRIPT_DIR / "models/cchess_adversarial_resattn.pt"
 
 
 def parse_args() -> argparse.Namespace:
@@ -59,6 +59,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--games", type=int, default=16, help="teacher-vs-teacher games per iteration")
     parser.add_argument("--max-game-length", type=int, default=160)
     parser.add_argument("--temperature-moves", type=int, default=18)
+    parser.add_argument("--temperature", type=float, default=1.0, help="sampling temperature for the first --temperature-moves plies")
+    parser.add_argument("--eval-temperature", type=float, default=0.0, help="sampling temperature after --temperature-moves")
     parser.add_argument("--learn-after-step", type=int, default=4)
     parser.add_argument("--replay-size", type=int, default=120000)
     parser.add_argument("--epochs", type=int, default=2)
@@ -79,8 +81,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--visual-games-every", type=int, default=1)
     parser.add_argument("--visual-games-max", type=int, default=1)
     parser.add_argument("--visual-gif-duration", type=int, default=420)
+    parser.add_argument(
+        "--visual-gif-max-frames",
+        type=int,
+        default=0,
+        help="maximum frames saved into each GIF; 0 keeps every move frame",
+    )
     parser.add_argument("--dry-run", action="store_true", help="build teachers/student and one tiny game, but do not save")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.temperature_moves < 0:
+        parser.error("--temperature-moves must be non-negative")
+    if args.temperature < 0 or args.eval_temperature < 0:
+        parser.error("temperatures must be non-negative")
+    return args
 
 
 @dataclass
@@ -324,6 +337,7 @@ class CChessTrainingGameVisualizer:
     margin: int = 42
     bottom: int = 62
     duration: int = 420
+    max_gif_frames: int = 0
 
     def should_capture(self, iteration: int, game_index: int) -> bool:
         if self.every <= 0:
@@ -352,8 +366,14 @@ class CChessTrainingGameVisualizer:
         target_dir = self.output_dir / f"iter_{iteration:04d}"
         target_dir.mkdir(parents=True, exist_ok=True)
         stem = f"{phase}_game_{game_index + 1:03d}"
-        images = [self._draw_frame(frame, winner=winner, phase=phase, pil=(Image, ImageDraw, ImageFont)) for frame in frames]
-        images[-1].save(target_dir / f"{stem}_final.png")
+        gif_frames = self._select_gif_frames(frames)
+        images = [
+            self._draw_frame(frame, winner=winner, phase=phase, pil=(Image, ImageDraw, ImageFont))
+            for frame in gif_frames
+        ]
+        self._draw_frame(frames[-1], winner=winner, phase=phase, pil=(Image, ImageDraw, ImageFont)).save(
+            target_dir / f"{stem}_final.png"
+        )
         images[0].save(
             target_dir / f"{stem}.gif",
             save_all=True,
@@ -361,6 +381,15 @@ class CChessTrainingGameVisualizer:
             duration=self.duration,
             loop=0,
         )
+
+    def _select_gif_frames(self, frames: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        limit = max(0, int(self.max_gif_frames))
+        if limit <= 0 or len(frames) <= limit:
+            return frames
+        if limit == 1:
+            return [frames[-1]]
+        indexes = [round(i * (len(frames) - 1) / (limit - 1)) for i in range(limit)]
+        return [frames[index] for index in indexes]
 
     def _draw_frame(self, frame: dict[str, Any], *, winner: int, phase: str, pil: tuple[Any, Any, Any]):
         Image, ImageDraw, ImageFont = pil
@@ -524,6 +553,12 @@ def sample_action(policy: np.ndarray, rng: random.Random, temperature: float) ->
     return ActionLabelsRed[int(rng.choices(range(ACTION_SIZE), weights=adjusted, k=1)[0])]
 
 
+def move_temperature(args: argparse.Namespace, ply: int) -> float:
+    if ply <= args.temperature_moves:
+        return args.temperature
+    return args.eval_temperature
+
+
 def mirror_move(move: str) -> str:
     return f"{8 - int(move[0])}{move[1]}{8 - int(move[2])}{move[3]}"
 
@@ -580,7 +615,7 @@ def teacher_game(
             planes = senv.state_to_planes(state)
             examples.extend(augment_example(planes, policy, value, mirror=args.mirror_augment))
 
-        temperature = 1.0 if step <= args.temperature_moves else 0.0
+        temperature = move_temperature(args, step)
         action = sample_action(policy, rng, temperature)
         if game_visualizer is not None:
             visual_state, visual_action = fixed_visual_state_action(state, action, step)
@@ -795,6 +830,7 @@ def main() -> None:
             every=args.visual_games_every,
             max_games_per_iteration=args.visual_games_max,
             duration=args.visual_gif_duration,
+            max_gif_frames=args.visual_gif_max_frames,
         )
         if args.visualize_games
         else None

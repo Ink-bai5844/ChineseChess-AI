@@ -71,7 +71,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--teacher-mcts-sims", type=int, default=0, help="teacher MCTS simulations per move; 0 uses direct policy")
     parser.add_argument("--cpuct", type=float, default=1.5)
     parser.add_argument("--teacher-cpuct", type=float, default=1.5)
-    parser.add_argument("--temp-threshold", type=int, default=18)
+    parser.add_argument("--temp-threshold", "--temperature-moves", dest="temp_threshold", type=int, default=18)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--eval-temperature", type=float, default=0.0, help="temperature after --temp-threshold")
     parser.add_argument("--dirichlet-alpha", type=float, default=0.3)
@@ -109,11 +109,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--visual-games-every", type=int, default=1)
     parser.add_argument("--visual-games-max", type=int, default=1)
     parser.add_argument("--visual-gif-duration", type=int, default=420)
+    parser.add_argument(
+        "--visual-gif-max-frames",
+        type=int,
+        default=0,
+        help="maximum frames saved into each GIF; 0 keeps every move frame",
+    )
 
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--save-examples", type=Path, default=None, help="optional .npz path for latest iteration examples")
     parser.add_argument("--dry-run", action="store_true", help="run one tiny iteration without saving checkpoint")
     args = parser.parse_args()
+    if args.temp_threshold < 0:
+        parser.error("--temperature-moves/--temp-threshold must be non-negative")
     if args.temperature < 0 or args.eval_temperature < 0:
         parser.error("temperatures must be non-negative")
     if args.exploration_frac < 0 or args.exploration_frac > 1:
@@ -591,6 +599,7 @@ def main() -> None:
             every=args.visual_games_every,
             max_games_per_iteration=args.visual_games_max,
             duration=args.visual_gif_duration,
+            max_gif_frames=args.visual_gif_max_frames,
         )
         if args.visualize_games
         else None

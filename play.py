@@ -6,7 +6,7 @@ import sys
 import math
 from datetime import datetime
 from pathlib import Path
-from threading import Thread
+from threading import Lock, Thread
 from time import sleep, time
 
 import numpy as np
@@ -47,11 +47,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ai-move-first", action="store_true", help="AI plays red and moves first")
     parser.add_argument("--piece-style", choices=PIECE_STYLES, default="WOOD")
     parser.add_argument("--bg-style", choices=BOARD_STYLES, default="WOOD")
-    parser.add_argument("--temperature", type=float, default=0.0, help="0 chooses the best move; >0 samples from policy")
+    parser.add_argument(
+        "--temperature",
+        "--global-temperature",
+        dest="temperature",
+        type=float,
+        default=0.0,
+        help="global AI move temperature for both direct policy and MCTS; 0 chooses the best move",
+    )
     parser.add_argument("--top-k", type=int, default=5, help="show the top-k legal moves in the side panel")
     parser.add_argument("--mcts-sims", type=int, default=0, help="MCTS simulations per AI move; 0 uses direct policy")
     parser.add_argument("--cpuct", type=float, default=1.5)
-    return parser.parse_args()
+    parser.add_argument("--ai-move-preview-seconds", type=float, default=2.0, help="flash the AI move before applying it")
+    args = parser.parse_args()
+    if args.temperature < 0:
+        parser.error("--temperature/--global-temperature must be non-negative")
+    return args
 
 
 class DistilledPolicy:
@@ -218,6 +229,11 @@ class DistilledPlayWithHuman:
         self.move_hints: dict[str, tuple[int, float, float]] = {}
         self.history: list[str] = []
         self.chessmans = None
+        self.ui_lock = Lock()
+        self.ai_move_preview: dict[str, float | str] | None = None
+        self.check_notice: str | None = None
+        self.game_over_notice: str | None = None
+        self.record_saved = False
         self.human_move_first = True
         if args.bg_style == "WOOD":
             self.chessman_w += 1
@@ -232,29 +248,40 @@ class DistilledPlayWithHuman:
         current_chessman = None
         if self.human_move_first:
             self.env.board.calc_chessmans_moving_list()
+        self.update_check_notice()
 
         ai_worker = Thread(target=self.ai_move, name="distilled_ai_worker", daemon=True)
         ai_worker.start()
 
-        while not self.env.board.is_end():
+        running = True
+        while running:
             for event in pygame.event.get():
                 if event.type == QUIT:
                     self.save_record_and_exit()
                 elif event.type == VIDEORESIZE:
                     pass
-                elif event.type == MOUSEBUTTONDOWN and self.human_move_first == self.env.red_to_move:
+                elif (
+                    event.type == MOUSEBUTTONDOWN
+                    and not self.env.board.is_end()
+                    and self.human_move_first == self.env.red_to_move
+                ):
                     current_chessman = self.handle_click(current_chessman)
+
+            if self.env.board.is_end() and not self.record_saved:
+                self.env.winner = self.env.board.winner
+                self.set_game_over_notice()
+                self.env.board.print_record()
+                self.save_record()
+                self.record_saved = True
 
             self.draw_widget(screen, widget_background)
             framerate.tick(30)
-            self.chessmans.clear(screen, board_background)
+            screen.blit(board_background, (0, 0))
             self.chessmans.update()
             self.chessmans.draw(screen)
+            self.draw_move_preview(screen)
+            self.draw_big_notice(screen)
             pygame.display.update()
-
-        self.env.board.print_record()
-        self.save_record()
-        sleep(2)
 
     def init_screen(self):
         screen = pygame.display.set_mode([self.screen_width, self.height], 0, 32)
@@ -318,6 +345,7 @@ class DistilledPlayWithHuman:
             captured_sprite.kill()
         current_chessman.is_selected = False
         self.history.append(self.env.get_state())
+        self.update_check_notice()
         return None
 
     def ai_move(self) -> None:
@@ -349,11 +377,14 @@ class DistilledPlayWithHuman:
             if chessman_sprite is None:
                 sleep(0.05)
                 continue
+            self.preview_ai_move(board_action)
             if captured_sprite:
                 self.chessmans.remove(captured_sprite)
                 captured_sprite.kill()
             chessman_sprite.move(x1, y1, self.chessman_w, self.chessman_h)
             self.history.append(self.env.get_state())
+            self.clear_ai_preview()
+            self.update_check_notice()
 
     def update_move_hints(self, policy: np.ndarray, value: float, debug: dict[str, tuple[int, float, float]] | None = None) -> None:
         self.move_hints = {}
@@ -406,6 +437,96 @@ class DistilledPlayWithHuman:
             self.draw_label(screen, widget_background, f"{value:.2f}", y, 12, 105)
             self.draw_label(screen, widget_background, f"{prior:.3f}", y, 12, 145)
 
+    def preview_ai_move(self, move: str) -> None:
+        duration = max(0.0, float(self.args.ai_move_preview_seconds))
+        if duration <= 0:
+            return
+        with self.ui_lock:
+            self.ai_move_preview = {"move": move, "until": time() + duration}
+        end_time = time() + duration
+        while time() < end_time and not self.env.board.is_end():
+            sleep(0.03)
+
+    def clear_ai_preview(self) -> None:
+        with self.ui_lock:
+            self.ai_move_preview = None
+
+    def draw_move_preview(self, screen) -> None:
+        with self.ui_lock:
+            preview = dict(self.ai_move_preview) if self.ai_move_preview else None
+        if not preview:
+            return
+        if time() > float(preview["until"]):
+            return
+        if int(time() * 5) % 2 == 0:
+            return
+        move = str(preview["move"])
+        sx, sy, dx, dy = [int(ch) for ch in move]
+        sxp, syp = self.board_point_center(sx, sy)
+        dxp, dyp = self.board_point_center(dx, dy)
+        overlay = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
+        pygame.draw.line(overlay, (37, 99, 235, 230), (sxp, syp), (dxp, dyp), 8)
+        pygame.draw.circle(overlay, (250, 204, 21, 210), (sxp, syp), 24, 5)
+        pygame.draw.circle(overlay, (239, 68, 68, 230), (dxp, dyp), 28, 6)
+        pygame.draw.circle(overlay, (239, 68, 68, 80), (dxp, dyp), 38)
+        screen.blit(overlay, (0, 0))
+
+    def board_point_center(self, col: int, row: int) -> tuple[int, int]:
+        return (
+            int(col * self.chessman_w + self.chessman_w / 2),
+            int((9 - row) * self.chessman_h + self.chessman_h / 2),
+        )
+
+    def update_check_notice(self) -> None:
+        if self.env.board.is_end():
+            self.check_notice = None
+            return
+        try:
+            in_check = self.env.board.is_check()
+        except Exception:
+            in_check = False
+        if not in_check:
+            self.check_notice = None
+            return
+        if self.env.red_to_move == self.human_move_first:
+            self.check_notice = "将军！"
+        else:
+            self.check_notice = "AI 被将军"
+
+    def set_game_over_notice(self) -> None:
+        winner = self.env.board.winner
+        human_is_red = self.human_move_first
+        if winner == Winner.draw or winner is None:
+            self.game_over_notice = "棋局结束"
+        elif (winner == Winner.red and human_is_red) or (winner == Winner.black and not human_is_red):
+            self.game_over_notice = "你赢了"
+        else:
+            self.game_over_notice = "AI 获胜"
+        self.check_notice = None
+
+    def draw_big_notice(self, screen) -> None:
+        text = self.game_over_notice or self.check_notice
+        if not text:
+            return
+        subtitle = "关闭窗口退出" if self.game_over_notice else "你的帅/将正被攻击" if self.check_notice == "将军！" else "继续行棋"
+        overlay = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 55 if self.game_over_notice else 25))
+        screen.blit(overlay, (0, 0))
+
+        font = get_font(self.config.resource.font_path, 64 if self.game_over_notice else 58)
+        sub_font = get_font(self.config.resource.font_path, 22)
+        label = font.render(text, True, (255, 255, 255))
+        sub_label = sub_font.render(subtitle, True, (255, 245, 200))
+        label_rect = label.get_rect(center=(self.width // 2, self.height // 2 - 22))
+        sub_rect = sub_label.get_rect(center=(self.width // 2, self.height // 2 + 38))
+        pad = 24
+        panel_rect = label_rect.union(sub_rect).inflate(pad * 2, pad * 2)
+        panel = pygame.Surface((panel_rect.width, panel_rect.height), pygame.SRCALPHA)
+        panel.fill((127, 29, 29, 220) if not self.game_over_notice else (17, 24, 39, 230))
+        screen.blit(panel, panel_rect.topleft)
+        screen.blit(label, label_rect)
+        screen.blit(sub_label, sub_rect)
+
     def draw_label(self, screen, widget_background, text: str, y: int, font_size: int, x: int | None = None) -> None:
         font = get_font(self.config.resource.font_path, font_size)
         label = font.render(text, True, (0, 0, 0), (255, 255, 255))
@@ -422,7 +543,9 @@ class DistilledPlayWithHuman:
 
     def save_record_and_exit(self) -> None:
         self.env.board.print_record()
-        self.save_record()
+        if not self.record_saved:
+            self.save_record()
+            self.record_saved = True
         pygame.quit()
         sys.exit()
 
