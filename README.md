@@ -10,6 +10,7 @@
   - `distill_cchess_alphazero.py`：原版 AlphaZero 教师对局蒸馏。
   - `train_adversarial.py`：学生自博弈 + 学生与教师对抗强化训练。
   - `train_dataset.py`：SQLite 大规模棋谱/局面数据监督训练。
+- 支持相对 Elo 评测：可任选学生模型、ChineseChess-AlphaZero、Pikafish 两两对弈，按胜率换算等级分差。
 - 支持训练棋局 GIF、终局 PNG、训练指标 CSV/PNG。
 - 支持人机对弈 UI：MCTS、全局 temperature、AI 落子前闪烁提示、将军大字提示、终局不自动关闭。
 
@@ -21,6 +22,7 @@
 ├── distill_cchess_alphazero.py      # ChineseChess-AlphaZero 教师蒸馏
 ├── train_adversarial.py            # 自博弈 + 与教师对抗训练
 ├── train_dataset.py                # SQLite 棋谱数据集监督训练
+├── eval_elo.py                     # 通用双模型/引擎对弈 Elo 评测
 ├── ChineseChess-AlphaZero/          # 上游项目、棋盘资源、教师模型
 ├── train_data/                     # SQLite 棋谱数据集
 ├── models/                         # PyTorch checkpoint
@@ -218,6 +220,74 @@ python train_dataset.py `
   --eval-games-max 4 `
   --eval-gif-max-frames 120
 ```
+
+### 5. 通用 Elo 评测
+
+`eval_elo.py` 支持任选两方：`student`、`alphazero`、`pikafish`。输出里的 `elo_diff_a_vs_b` 表示 A 相对 B 的等级分差；`--anchor-player` 和 `--anchor-elo` 可以给其中一方指定锚定分。
+
+学生模型 vs Pikafish：
+
+```powershell
+python eval_elo.py `
+  --player-a student `
+  --player-b pikafish `
+  --checkpoint models/cchess_dataset_midgame.pt `
+  --device cuda `
+  --require-cuda `
+  --games 200 `
+  --max-game-length 600 `
+  --student-mcts-sims 64 `
+  --pikafish-path Pikafish/Pikafish.2026-01-02/Windows/pikafish-avx2.exe `
+  --pikafish-nnue Pikafish/Pikafish.2026-01-02/pikafish.nnue `
+  --pikafish-threads 1 `
+  --pikafish-hash 128 `
+  --pikafish-depth 4 `
+  --temperature-moves 18 `
+  --opening-temperature 1.0 `
+  --temperature 0.05 `
+  --side alternate `
+  --anchor-player b `
+  --anchor-elo 0 `
+  --json-out runs/cchess_dataset_midgame_elo.json
+```
+
+学生模型 vs ChineseChess-AlphaZero：
+
+```powershell
+python eval_elo.py `
+  --player-a student `
+  --player-b alphazero `
+  --checkpoint models/cchess_dataset_midgame.pt `
+  --device cuda `
+  --require-cuda `
+  --games 200 `
+  --max-game-length 600 `
+  --a-mcts-sims 64 `
+  --b-mcts-sims 0 `
+  --alphazero-backend original-pytorch-h5 `
+  --side alternate `
+  --anchor-player b `
+  --anchor-elo 0
+```
+
+ChineseChess-AlphaZero vs Pikafish：
+
+```powershell
+python eval_elo.py `
+  --player-a alphazero `
+  --player-b pikafish `
+  --device cuda `
+  --require-cuda `
+  --games 200 `
+  --max-game-length 600 `
+  --a-mcts-sims 0 `
+  --pikafish-depth 2 `
+  --side alternate `
+  --anchor-player b `
+  --anchor-elo 0
+```
+
+如果想测“学生带搜索实战强度”，提高 `--a-mcts-sims`；如果想让 Pikafish 更强，提高 `--pikafish-depth`，或改用 `--pikafish-nodes` / `--pikafish-movetime-ms` 控制每步计算量。正式比较建议至少 `200` 局，粗略观察可先跑 `32` 或 `64` 局。
 
 ## 数据集说明
 
@@ -445,6 +515,45 @@ UI 行为：
 | `--eval-seed` | `17` | 评估随机种子 |
 | `--dry-run` | false | 小规模检查，不保存 |
 
+### eval_elo.py
+
+用途：任选两个模型/引擎批量对弈，并把 A 方得分率换算为相对 Elo。
+
+| 参数 | 默认值 | 说明 |
+|---|---:|---|
+| `--player-a`, `--a-player` | `student` | A 方类型：`student/alphazero/pikafish` |
+| `--player-b`, `--b-player` | `pikafish` | B 方类型：`student/alphazero/pikafish` |
+| `--checkpoint`, `--a-checkpoint` | `models/cchess_dataset_midgame.pt` | A 方为 student 时的 checkpoint |
+| `--b-checkpoint` | None | B 方为 student 时的 checkpoint；省略则复用 A checkpoint |
+| `--device` | auto | `cuda/cpu` |
+| `--require-cuda` | false | 要求必须使用 CUDA |
+| `--games` | `64` | 评测对局数 |
+| `--max-game-length` | `500` | 单局最大半回合数，超出按和棋/未分胜负处理 |
+| `--student-mcts-sims`, `--a-mcts-sims` | `64` | A 方为 student/alphazero 时每步 MCTS 次数 |
+| `--b-mcts-sims` | `0` | B 方为 student/alphazero 时每步 MCTS 次数 |
+| `--cpuct`, `--a-cpuct` | `1.5` | A 方 MCTS 探索系数 |
+| `--b-cpuct` | `1.5` | B 方 MCTS 探索系数 |
+| `--temperature-moves` | `18` | 前 N 个半回合使用开局温度 |
+| `--opening-temperature` | `1.0` | 前 N 步温度 |
+| `--temperature` | `0.0` | N 步之后温度 |
+| `--side` | `alternate` | `alternate/a-first/b-first/student-first/alphazero-first/pikafish-first/random` |
+| `--seed` | `29` | 随机种子 |
+| `--json-out` | None | 保存评测汇总 JSON |
+| `--alphazero-config` | model config | ChineseChess-AlphaZero config |
+| `--alphazero-weight` | model weight | ChineseChess-AlphaZero H5 权重 |
+| `--alphazero-backend` | `original-pytorch-h5` | `original-pytorch-h5/legacy-keras/fallback` |
+| `--pikafish-path` | `Pikafish/Pikafish.2026-01-02/Windows/pikafish-avx2.exe` | Pikafish 可执行文件 |
+| `--pikafish-nnue` | `Pikafish/Pikafish.2026-01-02/pikafish.nnue` | Pikafish NNUE 权重 |
+| `--pikafish-threads` | `1` | Pikafish 搜索线程数 |
+| `--pikafish-hash` | `128` | Pikafish Hash MB |
+| `--pikafish-depth` | `4` | Pikafish 每步搜索深度；小于等于 0 时关闭 depth 限制 |
+| `--pikafish-movetime-ms` | `0` | 不使用 depth/nodes 时，每步搜索毫秒数 |
+| `--pikafish-nodes` | `0` | Pikafish 每步节点数；大于 0 时优先于 movetime |
+| `--pikafish-timeout` | `30.0` | 等待 Pikafish 返回的超时秒数 |
+| `--anchor-player` | `b` | 哪一方使用锚定等级分：`a/b` |
+| `--anchor-elo` | `0.0` | 锚定等级分；0 表示只看相对分差 |
+| `--pikafish-elo` | None | 兼容旧命令，等价于 `--anchor-elo` |
+
 ## 训练日志
 
 示例：
@@ -485,5 +594,7 @@ epoch 2 | train 1266608 | policy_loss 2.4106 value_loss 0.5679 | acc 0.306 | val
 ## 致谢
 
 感谢 [NeymarL/ChineseChess-AlphaZero](https://github.com/NeymarL/ChineseChess-AlphaZero) 提供中国象棋 AlphaZero 基础实现、环境、资源和预训练模型。本项目在其基础上进行现代化改造、训练路线扩展和可视化实验。
+
+感谢 [official-pikafish/Pikafish](https://github.com/official-pikafish/Pikafish) 提供高强度中国象棋 UCI 引擎与 NNUE 评估能力，为本项目的模型对战评测和 Elo 对照实验提供了重要参考。
 
 感谢 ModelScope 数据集 [nowcan/xiangqi_train_data](https://modelscope.cn/datasets/nowcan/xiangqi_train_data) 的整理与发布，为本项目的数据集监督训练路线提供了大规模中国象棋棋局数据支持。
